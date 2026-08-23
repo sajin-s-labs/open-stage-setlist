@@ -1,0 +1,260 @@
+name: 🚀 Build & Release Multi-Platform Binaries
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Publish GitHub Release with binaries?'
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION: node24
+
+jobs:
+  # --------------------------------------------------------------------------
+  # JOB 1: Build Native Windows Binaries (.exe installer & portable)
+  # --------------------------------------------------------------------------
+  build-windows:
+    name: 🪟 Build Windows (.exe)
+    runs-on: windows-latest
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🟢 Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: 📦 Install Dependencies
+        run: npm install
+
+      - name: 🏗️ Build Production Bundle
+        run: npm run build
+
+      - name: 🪟 Package Windows Executables
+        run: npx electron-builder --win nsis portable --publish never
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 📋 Organize Windows Artifacts
+        shell: bash
+        run: |
+          mkdir -p release-win
+          cp release/*.exe release-win/ || true
+          ls -la release-win/
+
+      - name: 📤 Upload Windows Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-binaries
+          path: release-win/*.exe
+          retention-days: 14
+
+  # --------------------------------------------------------------------------
+  # JOB 2: Build Native Linux Binaries (.AppImage & tar.gz) & Standalone Web
+  # --------------------------------------------------------------------------
+  build-linux-and-web:
+    name: 🐧 Build Linux (.AppImage) & Web
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🟢 Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: 📦 Install Dependencies
+        run: npm install
+
+      - name: 🔍 Lint Code
+        run: npm run lint
+
+      - name: 🏗️ Build Production Bundle
+        run: npm run build
+
+      - name: 🗜️ Package Standalone Web Zip
+        run: |
+          mkdir -p release-linux
+          zip -r release-linux/OpenStageSetlist-v1.5.0-Web.zip dist/
+
+      - name: 🐧 Package Linux AppImage & Tarball
+        run: npx electron-builder --linux AppImage tar.gz --publish never
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 📋 Organize Linux Artifacts
+        run: |
+          cp release/*.AppImage release-linux/ 2>/dev/null || true
+          cp release/*.tar.gz release-linux/ 2>/dev/null || true
+          ls -la release-linux/
+
+      - name: 📤 Upload Linux & Web Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-web-binaries
+          path: |
+            release-linux/*.AppImage
+            release-linux/*.tar.gz
+            release-linux/*.zip
+          retention-days: 14
+
+  # --------------------------------------------------------------------------
+  # JOB 3: Build Android APK (.apk)
+  # --------------------------------------------------------------------------
+  build-android:
+    name: 📱 Build Android (.apk)
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: ☕ Setup Java 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'zulu'
+          java-version: '21'
+
+      - name: 🤖 Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: 🟢 Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: 📦 Install Dependencies
+        run: npm install
+
+      - name: 🏗️ Build Production Bundle
+        run: npm run build
+
+      - name: 🔄 Capacitor Sync Android
+        run: |
+          npx cap add android || true
+          npx cap sync android
+
+      - name: 🎨 Generate Android Launcher Icons from Logo
+        run: |
+          sudo apt-get update && sudo apt-get install -y imagemagick
+          for dir in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
+            RES="${dir%%:*}"
+            SIZE="${dir##*:}"
+            mkdir -p android/app/src/main/res/mipmap-${RES}
+            convert public/logo.png -resize ${SIZE}x${SIZE} android/app/src/main/res/mipmap-${RES}/ic_launcher.png
+            convert public/logo.png -resize ${SIZE}x${SIZE} android/app/src/main/res/mipmap-${RES}/ic_launcher_round.png
+            convert public/logo.png -resize $((${SIZE} * 2))x$((${SIZE} * 2)) android/app/src/main/res/mipmap-${RES}/ic_launcher_foreground.png
+          done
+          mkdir -p android/app/src/main/res/drawable
+          convert public/logo.png -resize 512x512 android/app/src/main/res/drawable/splash.png || true
+
+      - name: 🔨 Compile Android APK
+        working-directory: android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: 📋 Rename to Clean Final APK
+        run: |
+          mkdir -p android-output
+          if [ -f "android/app/build/outputs/apk/debug/app-debug.apk" ]; then
+            cp android/app/build/outputs/apk/debug/app-debug.apk android-output/OpenStageSetlist-v1.5.0.apk
+          elif [ -d "android/app/build/outputs/apk" ]; then
+            cp $(find android/app/build/outputs/apk -name "*.apk" | head -n 1) android-output/OpenStageSetlist-v1.5.0.apk
+          fi
+          ls -la android-output/
+
+      - name: 📤 Upload Android Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-binary
+          path: android-output/*.apk
+          retention-days: 14
+
+  # --------------------------------------------------------------------------
+  # JOB 4: Publish Official GitHub Release (Runs on Tags or Manual Dispatch)
+  # --------------------------------------------------------------------------
+  publish-release:
+    name: 🏷️ Publish GitHub Release
+    needs: [build-windows, build-linux-and-web, build-android]
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.create_release == true)
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 📂 Download Windows Binaries
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: windows-binaries
+          path: release-assets/
+
+      - name: 📂 Download Linux & Web Binaries
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: linux-web-binaries
+          path: release-assets/
+
+      - name: 📂 Download Android Binary
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: android-binary
+          path: release-assets/
+
+      - name: 🔍 Verify All Compiled Assets
+        run: |
+          mkdir -p release-assets
+          echo "=== 📦 Final Release Assets Ready for Publishing ==="
+          ls -lh release-assets/
+
+      - name: 🚀 Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name || 'v1.5.0' }}
+          name: "Open Stage Setlist ${{ github.ref_name || 'v1.5.0' }}"
+          body: |
+            ## 🎹 Open Stage Setlist ${{ github.ref_name || 'v1.5.0' }} Multi-Platform Release
+
+            **Modern, Distraction-Free Live Stage Setlist & Repertoire Binder for Musicians.**
+
+            ---
+
+            ### 📦 Download Binaries:
+            * 📱 **Android App:** `OpenStageSetlist-v1.5.0.apk` *(Direct installation on Android phones/tablets)*
+            * 🪟 **Windows Desktop Installer:** `Open Stage Setlist Setup 1.5.0.exe`
+            * 🪟 **Windows Portable Standalone:** `Open Stage Setlist 1.5.0.exe` *(Run without installing)*
+            * 🐧 **Linux Standalone:** `Open Stage Setlist-1.5.0.AppImage` *(Ubuntu, Fedora, Arch, Steam Deck)*
+            * 🐧 **Linux Tarball:** `open-stage-setlist-1.5.0.tar.gz`
+            * 🌐 **Offline Web Standalone Bundle:** `OpenStageSetlist-v1.5.0-Web.zip`
+
+            ---
+
+            ### 🌟 Key Highlights:
+            * **🌑 True 100% OLED Pitch Black Mode (`#000000`)**
+            * **🎨 Custom Theme Creator with live swatches**
+            * **🎹 Keyboard HUD with bank, style, tone, and ear-prompt melody cues**
+            * **🎸 Intelligent Chord Diagrams with closest-chord fallback**
+            * **☕ Dedicated Stage Intermission & Break Screen**
+            * **⚡ Hands-Free Auto-Scroll & Silent Metronome Pulse**
+          files: release-assets/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
